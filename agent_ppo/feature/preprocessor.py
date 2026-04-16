@@ -88,15 +88,40 @@ def _get_direction_to_target(from_pos, to_pos):
 
 
 def _count_wall_in_direction(map_info, center_row, center_col, direction, max_dist=5):
-    """计算某个方向上到墙壁的距离。"""
+    """计算某个方向上到墙壁的距离。
+
+    对于斜向(1,1)类型的方向，斜走一格需要两步经过两个直角边格子，
+    检测时需同时检查两步是否被堵（防止2x2角落误判为畅通）。
+    """
     dr, dc = direction
+    is_diagonal = (dr != 0 and dc != 0)
+
     for step in range(1, max_dist + 1):
         row = center_row + dr * step
         col = center_col + dc * step
+
         if not (0 <= row < len(map_info) and 0 <= col < len(map_info[0])):
             return float(step - 1)
         if map_info[row][col] != 0:
             return float(step - 1)
+
+        # 斜向移动：还需检查直角边格子（斜走两步过一格）
+        # 从(step-1, step-1)位置尝试向(dr, dc)方向斜走，
+        # 需要检查(步数*dr, 0)和(0, 步数*dc)两个直角边位置
+        if is_diagonal:
+            row_side1 = center_row + dr * (step - 1) + 0   # (dr*(step-1), 0)
+            col_side1 = center_col + dc * (step - 1) + dc  # (0, dc*(step-1)+dc)
+            row_side2 = center_row + dr * (step - 1) + dr  # (dr*(step-1)+dr, 0)
+            col_side2 = center_col + dc * (step - 1) + 0   # (0, dc*(step-1))
+
+            # 只检查step=1时的主直角边（2x2角落的判断关键）
+            if step == 1:
+                for r, c in [(row_side1, col_side1), (row_side2, col_side2)]:
+                    if not (0 <= r < len(map_info) and 0 <= c < len(map_info[0])):
+                        return float(step - 1)
+                    if map_info[r][c] != 0:
+                        return float(step - 1)
+
     return float(max_dist)
 
 
@@ -173,30 +198,53 @@ def _is_flash_direction_blocked(map_info, action_id, check_dist=2):
     dx, dz = FLASH_DIRECTIONS[action_id]
     is_diagonal = (dx != 0 and dz != 0)
 
-    # 检查闪现路径上的所有格子
-    for step in range(1, check_dist + 1):
-        # 对角线移动需要检查经过的格子
-        if is_diagonal:
-            # 斜向闪现：检查直角边经过的格子（避免穿墙角）
-            for sub_step in range(1, step + 1):
-                # 水平方向
-                r_h = center + dz * sub_step // step if step > 0 else center
-                c_h = center + dx * step // max(sub_step, 1)
-                # 垂直方向
-                r_v = center + dz * step // max(sub_step, 1)
-                c_v = center + dx * sub_step // step if step > 0 else center
-                for r, c in [(center + dz * step, center + dx * sub_step),
-                              (center + dz * sub_step, center + dx * step)]:
-                    if 0 <= r < len(map_info) and 0 <= c < len(map_info[0]):
-                        if map_info[r][c] != 0:
-                            return True
-        # 直线方向格子
-        row = center + dz * step
-        col = center + dx * step
-        if not (0 <= row < len(map_info) and 0 <= col < len(map_info[0])):
-            return True  # 超出地图=阻挡
-        if map_info[row][col] != 0:
-            return True  # 遇到墙
+    if is_diagonal:
+        # 斜向移动需要检查主路径和直角边格子
+        # 英雄在局部地图中心(0,0)位置，向(dx,dz)方向移动2格
+        # 主路径: (0,0)→(dx,dz)→(2*dx,2*dz)
+        # 直角边格子（必须畅通才能斜走）：
+        #   - 动作8/12(右移): 经过(0,1)和(1,0)时需要(dz,0)和(0,dx)畅通
+        #   - 动作9/13(下移): 经过(0,1)和(1,0)时需要(dz,0)和(0,dx)畅通
+        #   - 动作10/14(左移): 经过(0,-1)和(-1,0)时需要(dz,0)和(0,dx)畅通
+        #   - 动作11/15(上移): 经过(0,-1)和(-1,0)时需要(dz,0)和(0,dx)畅通
+        #
+        # 通用的直角边检查点：
+        # 斜向(1,1): 需检查(0,1)和(1,0)
+        # 斜向(-1,1): 需检查(0,-1)和(-1,1)
+        # 斜向(1,-1): 需检查(0,1)和(1,-1)  -- wait, let me recalculate
+
+        # 简化：对每个斜向，检测"第一步"旁边的两个直角边格子
+        # 从中心(0,0)向(dx,dz)方向，第一步到(dx,dz)
+        # 直角边格子 = (0,dz)和(dx,0)
+        side1_r = center + 0   # (0, dz) -> row = center + 0
+        side1_c = center + dz  # (0, dz) -> col = center + dz
+        side2_r = center + dx  # (dx, 0) -> row = center + dx
+        side2_c = center + 0   # (dx, 0) -> col = center + 0
+
+        # 检查直角边格子（step=1时）
+        for r, c in [(side1_r, side1_c), (side2_r, side2_c)]:
+            if not (0 <= r < len(map_info) and 0 <= c < len(map_info[0])):
+                return True
+            if map_info[r][c] != 0:
+                return True
+
+        # 检查主路径上的所有格子
+        for step in range(1, check_dist + 1):
+            row = center + dz * step
+            col = center + dx * step
+            if not (0 <= row < len(map_info) and 0 <= col < len(map_info[0])):
+                return True
+            if map_info[row][col] != 0:
+                return True
+    else:
+        # 直线方向
+        for step in range(1, check_dist + 1):
+            row = center + dz * step
+            col = center + dx * step
+            if not (0 <= row < len(map_info) and 0 <= col < len(map_info[0])):
+                return True
+            if map_info[row][col] != 0:
+                return True
 
     return False
 
@@ -235,6 +283,8 @@ class Preprocessor:
         self.last_min_monster_dist_norm = 0.5
         self.last_hero_pos = None
         self.consecutive_wall_hits = 0
+        self.diagonal_stuck_steps = 0      # 连续尝试斜向但被墙挡住的步数
+        self.attempted_diagonal_when_blocked = False  # 上一步是否尝试了被堵的斜向
         self.last_action = -1
         self.last_treasure_count = 0
         self.last_treasure_dist = None      # 上一步最近宝箱距离
@@ -476,6 +526,47 @@ class Preprocessor:
         # 保存当前位置
         self.last_hero_pos = (hero_pos["x"], hero_pos["z"])
 
+        # =========================================================================
+        # 7.3b 角落后退惩罚（新增）
+        # 场景：模型在角落/窄缝处反复尝试斜向移动但被堵
+        # 诊断：如果上一步尝试斜向+被墙挡住，且直线方向有空间 → 惩罚
+        # 使用已有的wall_dist_8dir（已在前面计算好）
+        # =========================================================================
+        corner_retreat_penalty = 0.0
+        is_in_corner = False
+
+        if (map_info is not None and len(map_info) >= 21
+                and self.last_action >= 0 and self.last_action < 8):
+            # wall_dist_8dir: 0右 1下 2左 3上 4右下 5左下 6左上 7右上
+            # 直线距离
+            cardinal_dists = [wall_dist_8dir[0], wall_dist_8dir[2], wall_dist_8dir[1], wall_dist_8dir[3]]
+            # 斜向距离
+            diagonal_dists = [wall_dist_8dir[4], wall_dist_8dir[5], wall_dist_8dir[6], wall_dist_8dir[7]]
+
+            min_cardinal = min(cardinal_dists)
+            is_diag_action = self.last_action >= 4  # 动作是斜向
+
+            # 检测1：当前处于角落/窄缝（至少两个斜向被堵，且直线有空间）
+            if sum(1 for d in diagonal_dists if d <= 0.15) >= 2 and min_cardinal >= 0.25:
+                is_in_corner = True
+
+            # 检测2：上一步尝试斜向+被墙挡住（纯斜向被堵场景）
+            if (is_diag_action and is_wall_hit and min_cardinal >= 0.25):
+                self.diagonal_stuck_steps += 1
+                self.attempted_diagonal_when_blocked = True
+            else:
+                if not is_diag_action or not is_wall_hit:
+                    self.diagonal_stuck_steps = 0
+
+            # 惩罚：连续尝试被堵的斜向动作
+            if self.diagonal_stuck_steps >= 2:
+                corner_retreat_penalty = -1.0 * self.diagonal_stuck_steps
+                corner_retreat_penalty = max(corner_retreat_penalty, -5.0)
+
+            # 奖励：处于角落但选择了直线方向（正确选择）
+            if is_in_corner and not is_diag_action and not is_wall_hit:
+                corner_retreat_penalty = 1.0  # 正确选择直线，给奖励
+
         # 7.4 卡住不动惩罚（仅记录，不惩罚）
         stuck_penalty = 0.0
 
@@ -705,7 +796,7 @@ class Preprocessor:
         raw_reward = (survive_reward + dist_shaping + wall_penalty + stuck_penalty +
                       treasure_reward + treasure_shaping + orbiting_penalty +
                       wall_magnet_penalty + straight_approach_bonus + treasure_view_bonus +
-                      flash_escape_bonus)
+                      flash_escape_bonus + corner_retreat_penalty)
         if not np.isfinite(raw_reward):
             raw_reward = 0.0
         reward = [np.clip(raw_reward, -50.0, 50.0)]
