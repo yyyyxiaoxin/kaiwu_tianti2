@@ -769,6 +769,62 @@ class Preprocessor:
                 idle_penalty = -0.1 * (self.idle_steps - 5)
                 idle_penalty = max(idle_penalty, -5.0)
 
+        # =========================================================================
+        # 7.11 500步后内侧贴墙奖励
+        # 思路：怪物加速后，英雄贴道路内边缘走可以让怪物走更长的外圈路径
+        # 地图左侧→贴道路右边(内侧)，地图右侧→贴道路左边(内侧)
+        # 地图上方→贴道路下方(内侧)，地图下方→贴道路上方(内侧)
+        # =========================================================================
+        inner_wall_bonus = 0.0
+
+        if self.step_no > 500 and last_action >= 0 and last_action < 8 and map_info is not None and len(map_info) >= 21:
+            center = len(map_info) // 2
+
+            # 判断英雄在地图的大致位置（0~1，0=最左/最上，1=最右/最下）
+            hero_pos_x_ratio = hero_pos["x"] / MAP_SIZE  # 水平位置比例
+            hero_pos_z_ratio = hero_pos["z"] / MAP_SIZE  # 垂直位置比例
+
+            # 计算各方向到墙的距离（已有wall_dist_8dir，但这里需要更精确的左右距离对比）
+            # 方向映射: 0右, 1下, 2左, 3上, 4右下, 5左下, 6左上, 7右上
+            dist_right = _count_wall_in_direction(map_info, center, center, (0, 1), max_dist=5)
+            dist_left = _count_wall_in_direction(map_info, center, center, (0, -1), max_dist=5)
+            dist_down = _count_wall_in_direction(map_info, center, center, (1, 0), max_dist=5)
+            dist_up = _count_wall_in_direction(map_info, center, center, (-1, 0), max_dist=5)
+
+            # 判断当前移动方向是否朝内侧贴墙
+            # 动作方向: 0右, 1下, 2左, 3上, 4右下, 5左下, 6左上, 7右上
+            is_moving_inner = False
+
+            # 英雄在地图左侧 (x < 40%) → 内侧是右 → 应贴右侧墙走
+            # 贴右侧墙走 = 右边墙近 + 往上或往下走
+            if hero_pos_x_ratio < 0.4:
+                # 在左侧，内侧是右。贴右侧墙 = dist_right小(1~2) 且 向下/上移动
+                if dist_right <= 2 and last_action in [1, 3]:  # 下或上
+                    is_moving_inner = True
+
+            # 英雄在地图右侧 (x > 60%) → 内侧是左 → 应贴左侧墙走
+            elif hero_pos_x_ratio > 0.6:
+                # 在右侧，内侧是左。贴左侧墙 = dist_left小(1~2) 且 向下/上移动
+                if dist_left <= 2 and last_action in [1, 3]:  # 下或上
+                    is_moving_inner = True
+
+            # 英雄在地图上方 (z < 40%) → 内侧是下 → 应贴下方墙走
+            if hero_pos_z_ratio < 0.4:
+                # 在上方，内侧是下。贴下方墙 = dist_down小(1~2) 且 向右/左移动
+                if dist_down <= 2 and last_action in [0, 2]:  # 右或左
+                    is_moving_inner = True
+
+            # 英雄在地图下方 (z > 60%) → 内侧是上 → 应贴上方墙走
+            elif hero_pos_z_ratio > 0.6:
+                # 在下方，内侧是上。贴上方墙 = dist_up小(1~2) 且 向右/左移动
+                if dist_up <= 2 and last_action in [0, 2]:  # 右或左
+                    is_moving_inner = True
+
+            if is_moving_inner:
+                # 贴内侧墙走，给奖励。步数越多（怪物越快），奖励越大
+                late_game_factor = min(1.0, (self.step_no - 500) / 500)  # 500步后逐步增大
+                inner_wall_bonus = 1.5 * (0.3 + 0.7 * late_game_factor)
+
         # 保存上次动作
         self.last_action = last_action
 
@@ -776,7 +832,8 @@ class Preprocessor:
         raw_reward = (survive_reward + dist_shaping + wall_penalty + stuck_penalty +
                       treasure_reward + treasure_shaping + orbiting_penalty +
                       wall_magnet_penalty + straight_approach_bonus + treasure_view_bonus +
-                      flash_through_monster_bonus + exploration_reward + idle_penalty)
+                      flash_through_monster_bonus + exploration_reward + idle_penalty +
+                      inner_wall_bonus)
         if not np.isfinite(raw_reward):
             raw_reward = 0.0
         reward = [np.clip(raw_reward, -50.0, 50.0)]
@@ -792,6 +849,7 @@ class Preprocessor:
                   f"flash_bonus={flash_through_monster_bonus:.2f}, "
                   f"explore_reward={exploration_reward:.2f}, "
                   f"idle_penalty={idle_penalty:.2f}, "
+                  f"inner_wall={inner_wall_bonus:.2f}, "
                   f"visited={visited_ratio:.0%}, "
                   f"idle_steps={self.idle_steps}")
 
