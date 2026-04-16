@@ -9,7 +9,7 @@ Author: Tencent AI Arena Authors
 Feature preprocessor and reward design for Gorge Chase PPO.
 峡谷追猎 PPO 特征预处理与奖励设计。
 
-特征维度（共42D）：
+特征维度（共53D）：
 - hero_self: 4D
 - monster_1: 7D (5D基础 + 方向2D)
 - monster_2: 7D (5D基础 + 方向2D)
@@ -17,6 +17,7 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 - treasure: 5D (方向2D + 距离1D + 是否极近1D + 收集数1D)
 - flash_available: 1D (闪现技能是否可用)
 - legal_action: 16D (8移动 + 8闪现)
+- exploration: 3D (已探索比例 + 当前格访问次数 + 停滞步数)
 - progress: 2D
 
 修改要点：
@@ -229,6 +230,10 @@ class Preprocessor:
     def __init__(self):
         self.reset()
 
+    # 探索网格分辨率：将128×128地图划分为 GRID_RES×GRID_RES 的网格
+    GRID_RES = 8  # 8×8=64个网格单元，每格16×16游戏单位
+    GRID_CELL_SIZE = MAP_SIZE / 8  # 每格16单位
+
     def reset(self):
         self.step_no = 0
         self.max_step = 200
@@ -242,6 +247,13 @@ class Preprocessor:
         self.near_treasure_orbit_steps = 0   # 在宝箱附近绕圈的步数
         self.treasure_blocked_steps = 0      # 宝箱路径被墙阻挡的连续步数
         self.last_monster_dist_when_approaching = None  # 上次靠近宝箱时的怪物距离
+
+        # ===== 探索追踪 =====
+        self.visit_grid = np.zeros((self.GRID_RES, self.GRID_RES), dtype=np.int32)  # 访问计数
+        self.total_visited_cells = 0          # 已访问的不同网格数
+        self.idle_steps = 0                   # 连续停滞步数（在同一网格内不动）
+        self.current_grid_cell = None         # 当前所在网格
+        self.last_grid_cell = None            # 上一步所在网格
 
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward.
@@ -423,14 +435,52 @@ class Preprocessor:
             legal_action[:8] = [1] * 8
 
         # =========================================================================
-        # 6. Progress features (2D)
+        # 6. 探索特征 (3D) / 已探索区域比例 + 当前格访问次数 + 停滞步数
+        # =========================================================================
+        # 将英雄位置映射到网格
+        grid_x = int(np.clip(hero_pos["x"] / self.GRID_CELL_SIZE, 0, self.GRID_RES - 1))
+        grid_z = int(np.clip(hero_pos["z"] / self.GRID_CELL_SIZE, 0, self.GRID_RES - 1))
+        self.current_grid_cell = (grid_x, grid_z)
+
+        # 更新访问计数
+        if self.visit_grid[grid_z, grid_x] == 0:
+            self.total_visited_cells += 1
+        self.visit_grid[grid_z, grid_x] += 1
+
+        # 计算停滞步数：在同一网格内未移动
+        if self.current_grid_cell == self.last_grid_cell:
+            self.idle_steps += 1
+        else:
+            self.idle_steps = 0
+
+        # 已探索区域比例
+        max_visitable_cells = self.GRID_RES * self.GRID_RES  # 64
+        visited_ratio = min(1.0, self.total_visited_cells / max_visitable_cells)
+
+        # 当前格访问次数（归一化，高频=重复访问=停滞）
+        current_cell_visits_norm = min(1.0, self.visit_grid[grid_z, grid_x] / 50.0)
+
+        # 停滞步数归一化
+        idle_steps_norm = min(1.0, self.idle_steps / 30.0)
+
+        exploration_feat = np.array([
+            visited_ratio,              # 已探索比例
+            current_cell_visits_norm,    # 当前格重复访问度
+            idle_steps_norm,             # 停滞程度
+        ], dtype=np.float32)
+
+        # 保存当前网格
+        self.last_grid_cell = self.current_grid_cell
+
+        # =========================================================================
+        # 7. Progress features (2D)
         # =========================================================================
         step_norm = _norm(self.step_no, self.max_step)
         survival_ratio = step_norm
         progress_feat = np.array([step_norm, survival_ratio], dtype=np.float32)
 
         # =========================================================================
-        # 拼接特征向量 (42D)
+        # 拼接特征向量 (53D)
         # =========================================================================
         feature = np.concatenate([
             hero_feat,                    # 4D
@@ -440,6 +490,7 @@ class Preprocessor:
             treasure_feat,               # 5D
             np.array([flash_available], dtype=np.float32),  # 1D
             np.array(legal_action, dtype=np.float32),  # 16D
+            exploration_feat,            # 3D
             progress_feat,               # 2D
         ])
 
@@ -679,6 +730,45 @@ class Preprocessor:
                     # 闪现方向与怪物方向相反（远离怪物方向闪现），轻微奖励（也不错但不如穿越）
                     flash_through_monster_bonus = 1.0 * abs(direction_match)
 
+        # =========================================================================
+        # 7.10 探索奖励 + 停滞惩罚
+        # 核心思路：鼓励智能体探索未访问区域，惩罚长时间停留在同一区域
+        # =========================================================================
+        exploration_reward = 0.0
+        idle_penalty = 0.0
+
+        # --- 新区域探索奖励 ---
+        # 进入新的网格单元时给奖励（首次访问）
+        if self.visit_grid[grid_z, grid_x] == 1:
+            # 首次访问该网格，给探索奖励
+            # 探索比例越低（早期），奖励越大；探索比例越高（后期），奖励递减
+            exploration_bonus_factor = max(0.3, 1.0 - visited_ratio)
+            exploration_reward = 2.0 * exploration_bonus_factor
+
+        # --- 重访次数衰减奖励 ---
+        # 即使不是首次访问，只要不是频繁重访也给微小奖励（鼓励移动）
+        elif self.visit_grid[grid_z, grid_x] <= 3:
+            exploration_reward = 0.2
+
+        # --- 停滞惩罚 ---
+        # 在同一网格内停滞超过一定步数就惩罚
+        if self.idle_steps > 10:
+            # 停滞10步以上开始惩罚，越久惩罚越重
+            idle_penalty = -0.05 * (self.idle_steps - 10)
+            # 封顶惩罚
+            idle_penalty = max(idle_penalty, -3.0)
+
+        # --- 无怪物威胁时加强探索激励 ---
+        # 当没有怪物在视野内时，加大探索奖励和停滞惩罚
+        any_monster_visible = any(m.get("is_in_view", 0) for m in monsters)
+        if not any_monster_visible:
+            # 无怪物威胁：探索奖励翻倍，停滞惩罚加重
+            exploration_reward *= 2.0
+            if self.idle_steps > 5:
+                # 5步以上就开始惩罚（比有怪物时更严格）
+                idle_penalty = -0.1 * (self.idle_steps - 5)
+                idle_penalty = max(idle_penalty, -5.0)
+
         # 保存上次动作
         self.last_action = last_action
 
@@ -686,7 +776,7 @@ class Preprocessor:
         raw_reward = (survive_reward + dist_shaping + wall_penalty + stuck_penalty +
                       treasure_reward + treasure_shaping + orbiting_penalty +
                       wall_magnet_penalty + straight_approach_bonus + treasure_view_bonus +
-                      flash_through_monster_bonus)
+                      flash_through_monster_bonus + exploration_reward + idle_penalty)
         if not np.isfinite(raw_reward):
             raw_reward = 0.0
         reward = [np.clip(raw_reward, -50.0, 50.0)]
@@ -699,6 +789,10 @@ class Preprocessor:
                   f"monster_decay={monster_threat_decay:.2f}, "
                   f"total_decay={total_decay:.2f}, "
                   f"treasure_reward={treasure_reward:.1f}, "
-                  f"flash_bonus={flash_through_monster_bonus:.2f}")
+                  f"flash_bonus={flash_through_monster_bonus:.2f}, "
+                  f"explore_reward={exploration_reward:.2f}, "
+                  f"idle_penalty={idle_penalty:.2f}, "
+                  f"visited={visited_ratio:.0%}, "
+                  f"idle_steps={self.idle_steps}")
 
         return feature, legal_action, reward
