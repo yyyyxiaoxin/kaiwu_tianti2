@@ -13,7 +13,7 @@ Configuration for Gorge Chase PPO.
 
 class Config:
 
-    # 特征维度（共53D）
+    # 特征维度（共42D）
     # - hero_self: 4D
     # - monster_1: 7D (5D基础 + 方向2D)
     # - monster_2: 7D (5D基础 + 方向2D)
@@ -21,7 +21,6 @@ class Config:
     # - treasure: 5D (方向2D + 距离1D + 是否极近1D + 收集数1D)
     # - flash_available: 1D (闪现是否可用)
     # - legal_action: 16D (8移动 + 8闪现)
-    # - exploration: 3D (已探索区域比例1D + 本格访问次数1D + 停滞步数1D)
     # - progress: 2D
     FEATURES = [
         4,   # hero_self
@@ -31,7 +30,6 @@ class Config:
         5,   # treasure (方向2 + 距离1 + 极近标志1 + 收集数1)
         1,   # flash_available
         16,  # legal_action (8移动 + 8闪现)
-        3,   # exploration (已探索比例 + 当前格访问次数 + 停滞步数)
         2,   # progress
     ]
     FEATURE_SPLIT_SHAPE = FEATURES

@@ -9,7 +9,7 @@ Author: Tencent AI Arena Authors
 Feature preprocessor and reward design for Gorge Chase PPO.
 峡谷追猎 PPO 特征预处理与奖励设计。
 
-特征维度（共53D）：
+特征维度（共42D）：
 - hero_self: 4D
 - monster_1: 7D (5D基础 + 方向2D)
 - monster_2: 7D (5D基础 + 方向2D)
@@ -17,7 +17,6 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 - treasure: 5D (方向2D + 距离1D + 是否极近1D + 收集数1D)
 - flash_available: 1D (闪现技能是否可用)
 - legal_action: 16D (8移动 + 8闪现)
-- exploration: 3D (已探索比例 + 当前格访问次数 + 停滞步数)
 - progress: 2D
 
 修改要点：
@@ -25,7 +24,7 @@ Feature preprocessor and reward design for Gorge Chase PPO.
 2. 增加宝箱距离特征，解决斜向走绕宝箱问题
 3. 增加绕宝箱惩罚和接近宝箱奖励
 4. 动作空间扩展为16维（8移动+8闪现），支持闪现技能
-5. 怪物近距离时，朝怪物方向闪现给予高额奖励（穿越怪物逃生）
+5. 怪物近距离时，朝怪物反向闪现给予最高奖励（极危险时反向逃跑）
 """
 
 import numpy as np
@@ -41,9 +40,9 @@ MAX_BUFF_DURATION = 50.0
 # 宝箱"极近"距离阈值（格数，1×1英雄时宝箱需要踩上去）
 TREASURE_VERY_CLOSE_DIST = 2.0
 
-# 闪现触发距离阈值：怪物在2-3格内时鼓励朝怪物闪现
-FLASH_MONSTER_DIST_MIN = 0.5   # 太近时闪现可能来不及，不鼓励
-FLASH_MONSTER_DIST_MAX = 3.5   # 3.5格以内开始鼓励闪现
+# 闪现触发距离阈值
+FLASH_MONSTER_DIST_VERY_CLOSE = 2.0  # 2.0格以内：极危险，必须反向闪现
+FLASH_MONSTER_DIST_CLOSE = 3.5        # 3.5格以内：较危险，反向或穿越都可以
 
 # 动作方向映射（8移动+8闪现）
 # 移动0-7: 右、下、左、上、右下、左下、左上、右上
@@ -230,10 +229,6 @@ class Preprocessor:
     def __init__(self):
         self.reset()
 
-    # 探索网格分辨率：将128×128地图划分为 GRID_RES×GRID_RES 的网格
-    GRID_RES = 8  # 8×8=64个网格单元，每格16×16游戏单位
-    GRID_CELL_SIZE = MAP_SIZE / 8  # 每格16单位
-
     def reset(self):
         self.step_no = 0
         self.max_step = 200
@@ -247,13 +242,6 @@ class Preprocessor:
         self.near_treasure_orbit_steps = 0   # 在宝箱附近绕圈的步数
         self.treasure_blocked_steps = 0      # 宝箱路径被墙阻挡的连续步数
         self.last_monster_dist_when_approaching = None  # 上次靠近宝箱时的怪物距离
-
-        # ===== 探索追踪 =====
-        self.visit_grid = np.zeros((self.GRID_RES, self.GRID_RES), dtype=np.int32)  # 访问计数
-        self.total_visited_cells = 0          # 已访问的不同网格数
-        self.idle_steps = 0                   # 连续停滞步数（在同一网格内不动）
-        self.current_grid_cell = None         # 当前所在网格
-        self.last_grid_cell = None            # 上一步所在网格
 
     def feature_process(self, env_obs, last_action):
         """Process env_obs into feature vector, legal_action mask, and reward.
@@ -435,52 +423,14 @@ class Preprocessor:
             legal_action[:8] = [1] * 8
 
         # =========================================================================
-        # 6. 探索特征 (3D) / 已探索区域比例 + 当前格访问次数 + 停滞步数
-        # =========================================================================
-        # 将英雄位置映射到网格
-        grid_x = int(np.clip(hero_pos["x"] / self.GRID_CELL_SIZE, 0, self.GRID_RES - 1))
-        grid_z = int(np.clip(hero_pos["z"] / self.GRID_CELL_SIZE, 0, self.GRID_RES - 1))
-        self.current_grid_cell = (grid_x, grid_z)
-
-        # 更新访问计数
-        if self.visit_grid[grid_z, grid_x] == 0:
-            self.total_visited_cells += 1
-        self.visit_grid[grid_z, grid_x] += 1
-
-        # 计算停滞步数：在同一网格内未移动
-        if self.current_grid_cell == self.last_grid_cell:
-            self.idle_steps += 1
-        else:
-            self.idle_steps = 0
-
-        # 已探索区域比例
-        max_visitable_cells = self.GRID_RES * self.GRID_RES  # 64
-        visited_ratio = min(1.0, self.total_visited_cells / max_visitable_cells)
-
-        # 当前格访问次数（归一化，高频=重复访问=停滞）
-        current_cell_visits_norm = min(1.0, self.visit_grid[grid_z, grid_x] / 50.0)
-
-        # 停滞步数归一化
-        idle_steps_norm = min(1.0, self.idle_steps / 30.0)
-
-        exploration_feat = np.array([
-            visited_ratio,              # 已探索比例
-            current_cell_visits_norm,    # 当前格重复访问度
-            idle_steps_norm,             # 停滞程度
-        ], dtype=np.float32)
-
-        # 保存当前网格
-        self.last_grid_cell = self.current_grid_cell
-
-        # =========================================================================
-        # 7. Progress features (2D)
+        # 6. Progress features (2D)
         # =========================================================================
         step_norm = _norm(self.step_no, self.max_step)
         survival_ratio = step_norm
         progress_feat = np.array([step_norm, survival_ratio], dtype=np.float32)
 
         # =========================================================================
-        # 拼接特征向量 (53D)
+        # 拼接特征向量 (42D)
         # =========================================================================
         feature = np.concatenate([
             hero_feat,                    # 4D
@@ -490,7 +440,6 @@ class Preprocessor:
             treasure_feat,               # 5D
             np.array([flash_available], dtype=np.float32),  # 1D
             np.array(legal_action, dtype=np.float32),  # 16D
-            exploration_feat,            # 3D
             progress_feat,               # 2D
         ])
 
@@ -691,11 +640,13 @@ class Preprocessor:
             treasure_view_bonus = 0.02 * total_decay
 
         # =========================================================================
-        # 7.9 朝怪物方向闪现奖励（核心新增）
-        # 思路：当怪物在2-3格内时，朝怪物方向闪现可以穿越怪物逃生
-        # 闪现2格 → 怪物在身后 → 拉开距离 → 生存
+        # 7.9 闪现逃生奖励（修复版）
+        # 核心思路：
+        #   - 怪物极近（<2格）：必须反向闪现逃跑，给最高奖励
+        #   - 怪物较近（2~3.5格）：反向闪现或穿越都可以，给中等奖励
+        #   - 反向闪现比穿越奖励更高，因为更安全
         # =========================================================================
-        flash_through_monster_bonus = 0.0
+        flash_escape_bonus = 0.0
 
         if last_action >= 8 and flash_available > 0.5:
             # 上一步执行了闪现动作
@@ -715,115 +666,37 @@ class Preprocessor:
                         # 怪物相对英雄的方向（英雄→怪物）
                         closest_monster_dir_x, closest_monster_dir_z = _get_direction_to_target(hero_pos, m_pos)
 
-            # 只在怪物距离2-3格时触发（太远没意义，太近可能已被抓）
-            if (FLASH_MONSTER_DIST_MIN < closest_monster_raw_dist < FLASH_MONSTER_DIST_MAX):
+            # 只在怪物距离3.5格以内时触发
+            if closest_monster_raw_dist < FLASH_MONSTER_DIST_CLOSE:
                 # 计算闪现动作方向与怪物方向的对齐度
+                # > 0 表示朝怪物方向，< 0 表示远离怪物方向
                 direction_match = _get_action_direction_match(last_action, closest_monster_dir_x, closest_monster_dir_z)
 
-                if direction_match > 0.3:
-                    # 朝怪物方向闪现（方向匹配度>0.3），给予高额奖励
-                    # 奖励与匹配度和危险程度成正比
-                    danger_factor = 1.0 - (closest_monster_raw_dist - FLASH_MONSTER_DIST_MIN) / (FLASH_MONSTER_DIST_MAX - FLASH_MONSTER_DIST_MIN)
-                    danger_factor = max(0.0, min(1.0, danger_factor))  # 越近越危险=奖励越大
-                    flash_through_monster_bonus = 8.0 * direction_match * danger_factor
-                elif direction_match < -0.3:
-                    # 闪现方向与怪物方向相反（远离怪物方向闪现），轻微奖励（也不错但不如穿越）
-                    flash_through_monster_bonus = 1.0 * abs(direction_match)
+                # 危险程度：越近越危险
+                if closest_monster_raw_dist < FLASH_MONSTER_DIST_VERY_CLOSE:
+                    # ===== 极近距离（<2格）：必须反向闪现 = 最高奖励 =====
+                    # 反向闪现（direction_match < -0.3）
+                    if direction_match < -0.3:
+                        # 越近+方向越正（完全反向）=奖励越高
+                        reverse_factor = abs(direction_match)  # 0.3~1.0
+                        proximity_factor = 1.0 - closest_monster_raw_dist / FLASH_MONSTER_DIST_VERY_CLOSE
+                        proximity_factor = max(0.0, min(1.0, proximity_factor))
+                        # 反向闪现最高奖励：10.0 × 反向程度 × 距离紧迫度
+                        flash_escape_bonus = 10.0 * reverse_factor * (0.5 + 0.5 * proximity_factor)
+                    # 朝怪物方向闪现（穿越）：只给微小奖励（不如反向安全）
+                    elif direction_match > 0.3:
+                        flash_escape_bonus = 1.0 * direction_match
 
-        # =========================================================================
-        # 7.10 探索奖励 + 停滞惩罚
-        # 核心思路：鼓励智能体探索未访问区域，惩罚长时间停留在同一区域
-        # =========================================================================
-        exploration_reward = 0.0
-        idle_penalty = 0.0
-
-        # --- 新区域探索奖励 ---
-        # 进入新的网格单元时给奖励（首次访问）
-        if self.visit_grid[grid_z, grid_x] == 1:
-            # 首次访问该网格，给探索奖励
-            # 探索比例越低（早期），奖励越大；探索比例越高（后期），奖励递减
-            exploration_bonus_factor = max(0.3, 1.0 - visited_ratio)
-            exploration_reward = 2.0 * exploration_bonus_factor
-
-        # --- 重访次数衰减奖励 ---
-        # 即使不是首次访问，只要不是频繁重访也给微小奖励（鼓励移动）
-        elif self.visit_grid[grid_z, grid_x] <= 3:
-            exploration_reward = 0.2
-
-        # --- 停滞惩罚 ---
-        # 在同一网格内停滞超过一定步数就惩罚
-        if self.idle_steps > 10:
-            # 停滞10步以上开始惩罚，越久惩罚越重
-            idle_penalty = -0.05 * (self.idle_steps - 10)
-            # 封顶惩罚
-            idle_penalty = max(idle_penalty, -3.0)
-
-        # --- 无怪物威胁时加强探索激励 ---
-        # 当没有怪物在视野内时，加大探索奖励和停滞惩罚
-        any_monster_visible = any(m.get("is_in_view", 0) for m in monsters)
-        if not any_monster_visible:
-            # 无怪物威胁：探索奖励翻倍，停滞惩罚加重
-            exploration_reward *= 2.0
-            if self.idle_steps > 5:
-                # 5步以上就开始惩罚（比有怪物时更严格）
-                idle_penalty = -0.1 * (self.idle_steps - 5)
-                idle_penalty = max(idle_penalty, -5.0)
-
-        # =========================================================================
-        # 7.11 500步后内侧贴墙奖励
-        # 思路：怪物加速后，英雄贴道路内边缘走可以让怪物走更长的外圈路径
-        # 地图左侧→贴道路右边(内侧)，地图右侧→贴道路左边(内侧)
-        # 地图上方→贴道路下方(内侧)，地图下方→贴道路上方(内侧)
-        # =========================================================================
-        inner_wall_bonus = 0.0
-
-        if self.step_no > 500 and last_action >= 0 and last_action < 8 and map_info is not None and len(map_info) >= 21:
-            center = len(map_info) // 2
-
-            # 判断英雄在地图的大致位置（0~1，0=最左/最上，1=最右/最下）
-            hero_pos_x_ratio = hero_pos["x"] / MAP_SIZE  # 水平位置比例
-            hero_pos_z_ratio = hero_pos["z"] / MAP_SIZE  # 垂直位置比例
-
-            # 计算各方向到墙的距离（已有wall_dist_8dir，但这里需要更精确的左右距离对比）
-            # 方向映射: 0右, 1下, 2左, 3上, 4右下, 5左下, 6左上, 7右上
-            dist_right = _count_wall_in_direction(map_info, center, center, (0, 1), max_dist=5)
-            dist_left = _count_wall_in_direction(map_info, center, center, (0, -1), max_dist=5)
-            dist_down = _count_wall_in_direction(map_info, center, center, (1, 0), max_dist=5)
-            dist_up = _count_wall_in_direction(map_info, center, center, (-1, 0), max_dist=5)
-
-            # 判断当前移动方向是否朝内侧贴墙
-            # 动作方向: 0右, 1下, 2左, 3上, 4右下, 5左下, 6左上, 7右上
-            is_moving_inner = False
-
-            # 英雄在地图左侧 (x < 40%) → 内侧是右 → 应贴右侧墙走
-            # 贴右侧墙走 = 右边墙近 + 往上或往下走
-            if hero_pos_x_ratio < 0.4:
-                # 在左侧，内侧是右。贴右侧墙 = dist_right小(1~2) 且 向下/上移动
-                if dist_right <= 2 and last_action in [1, 3]:  # 下或上
-                    is_moving_inner = True
-
-            # 英雄在地图右侧 (x > 60%) → 内侧是左 → 应贴左侧墙走
-            elif hero_pos_x_ratio > 0.6:
-                # 在右侧，内侧是左。贴左侧墙 = dist_left小(1~2) 且 向下/上移动
-                if dist_left <= 2 and last_action in [1, 3]:  # 下或上
-                    is_moving_inner = True
-
-            # 英雄在地图上方 (z < 40%) → 内侧是下 → 应贴下方墙走
-            if hero_pos_z_ratio < 0.4:
-                # 在上方，内侧是下。贴下方墙 = dist_down小(1~2) 且 向右/左移动
-                if dist_down <= 2 and last_action in [0, 2]:  # 右或左
-                    is_moving_inner = True
-
-            # 英雄在地图下方 (z > 60%) → 内侧是上 → 应贴上方墙走
-            elif hero_pos_z_ratio > 0.6:
-                # 在下方，内侧是上。贴上方墙 = dist_up小(1~2) 且 向右/左移动
-                if dist_up <= 2 and last_action in [0, 2]:  # 右或左
-                    is_moving_inner = True
-
-            if is_moving_inner:
-                # 贴内侧墙走，给奖励。步数越多（怪物越快），奖励越大
-                late_game_factor = min(1.0, (self.step_no - 500) / 500)  # 500步后逐步增大
-                inner_wall_bonus = 1.5 * (0.3 + 0.7 * late_game_factor)
+                else:
+                    # ===== 较近距离（2~3.5格）：反向闪现或穿越都可以 =====
+                    if direction_match < -0.3:
+                        # 反向闪现：中等奖励
+                        reverse_factor = abs(direction_match)
+                        flash_escape_bonus = 5.0 * reverse_factor
+                    elif direction_match > 0.3:
+                        # 穿越闪现（朝怪物方向）：较低奖励
+                        # 因为怪物不太近时穿越不是最优解
+                        flash_escape_bonus = 3.0 * direction_match
 
         # 保存上次动作
         self.last_action = last_action
@@ -832,8 +705,7 @@ class Preprocessor:
         raw_reward = (survive_reward + dist_shaping + wall_penalty + stuck_penalty +
                       treasure_reward + treasure_shaping + orbiting_penalty +
                       wall_magnet_penalty + straight_approach_bonus + treasure_view_bonus +
-                      flash_through_monster_bonus + exploration_reward + idle_penalty +
-                      inner_wall_bonus)
+                      flash_escape_bonus)
         if not np.isfinite(raw_reward):
             raw_reward = 0.0
         reward = [np.clip(raw_reward, -50.0, 50.0)]
@@ -846,11 +718,6 @@ class Preprocessor:
                   f"monster_decay={monster_threat_decay:.2f}, "
                   f"total_decay={total_decay:.2f}, "
                   f"treasure_reward={treasure_reward:.1f}, "
-                  f"flash_bonus={flash_through_monster_bonus:.2f}, "
-                  f"explore_reward={exploration_reward:.2f}, "
-                  f"idle_penalty={idle_penalty:.2f}, "
-                  f"inner_wall={inner_wall_bonus:.2f}, "
-                  f"visited={visited_ratio:.0%}, "
-                  f"idle_steps={self.idle_steps}")
+                  f"flash_escape={flash_escape_bonus:.2f}")
 
         return feature, legal_action, reward

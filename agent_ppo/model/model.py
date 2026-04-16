@@ -10,7 +10,7 @@ Neural network model for Gorge Chase PPO.
 峡谷追猎 PPO 神经网络模型。
 
 改进：
-1. 加深网络: 53→256→128→64（原 47→128→64）
+1. 加深网络: 42→256→128→64（原 47→128→64）
 2. 添加 LayerNorm 提升训练稳定性
 3. Actor/Critic 独立层，减少策略和价值之间的干扰
 4. 正交初始化
@@ -39,11 +39,11 @@ class Model(nn.Module):
         self.model_name = "gorge_chase_lite"
         self.device = device
 
-        input_dim = Config.DIM_OF_OBSERVATION  # 53
+        input_dim = Config.DIM_OF_OBSERVATION  # 42
         action_num = Config.ACTION_NUM           # 16
         value_num = Config.VALUE_NUM             # 1
 
-        # Shared backbone: 53 → 256 → 128
+        # Shared backbone: 42 → 256 → 128
         self.backbone = nn.Sequential(
             make_fc_layer(input_dim, 256),
             nn.LayerNorm(256),
