@@ -577,12 +577,13 @@ class Preprocessor:
             treasure_reward = new_treasures * 15.0  # 10→15，强化宝箱收集动机
         self.last_treasure_count = treasures_collected
 
-        # 7.6 宝箱接近奖励塑形（核心改进：解决绕宝箱走+被墙吸附+怪物威胁问题）
-        treasure_shaping = 0.0
-        orbiting_penalty = 0.0  # 绕宝箱惩罚
-        wall_magnet_penalty = 0.0  # 被墙吸附惩罚
+        # =========================================================================
+        # 7.5b 墙吸附惩罚（增强）：修复宝箱与智能体之间有墙时的卡墙问题
+        # 核心问题：即使路径被阻挡，宝箱仍有吸引力，智能体会冲向墙边
+        # 解决方案：路径检测前置，撞墙+朝被阻挡方向移动立即触发惩罚
+        # =========================================================================
 
-        # ===== 路径阻挡检测 =====
+        # ===== 路径阻挡检测（前置）=====
         is_path_blocked = False
         if (nearest_treasure_pos is not None
                 and np.isfinite(nearest_treasure_dist)
@@ -590,17 +591,46 @@ class Preprocessor:
                 and map_info is not None):
             is_path_blocked = _is_path_blocked_to_treasure(map_info, hero_pos, nearest_treasure_pos)
 
-        # 更新被阻挡连续步数
-        if is_path_blocked:
+        # ===== 检测是否朝被阻挡方向移动 =====
+        is_heading_blocked_direction = False  # 当前是否朝被阻挡方向移动
+        if (nearest_treasure_pos is not None
+                and np.isfinite(nearest_treasure_dist)
+                and last_action >= 0 and last_action < 8
+                and self.last_treasure_dist is not None
+                and np.isfinite(self.last_treasure_dist)):
+            dx_treasure = nearest_treasure_pos["x"] - hero_pos["x"]
+            dz_treasure = nearest_treasure_pos["z"] - hero_pos["z"]
+            treasure_dist_raw = np.sqrt(dx_treasure ** 2 + dz_treasure ** 2)
+
+            if treasure_dist_raw > 0.1:
+                t_dir_x = dx_treasure / treasure_dist_raw
+                t_dir_z = dz_treasure / treasure_dist_raw
+                act_dx, act_dz = ACTION_DIRECTIONS.get(last_action, (0, 0))
+                if act_dx != 0 or act_dz != 0:
+                    direction_alignment = act_dx * t_dir_x + act_dz * t_dir_z
+                    if direction_alignment > 0.5 and is_path_blocked:
+                        is_heading_blocked_direction = True
+
+        # 更新被阻挡连续步数：朝被阻挡方向+撞墙时累加，否则衰减
+        if is_heading_blocked_direction and is_wall_hit:
             self.treasure_blocked_steps += 1
         else:
-            self.treasure_blocked_steps = max(0, self.treasure_blocked_steps - 2)  # 快速恢复
+            self.treasure_blocked_steps = max(0, self.treasure_blocked_steps - 1)
+
+        # 墙吸附惩罚：撞墙+朝被阻挡方向移动时立即触发
+        wall_magnet_penalty = 0.0
+        if is_heading_blocked_direction and is_wall_hit and self.treasure_blocked_steps >= 1:
+            wall_magnet_penalty = -2.0 * self.treasure_blocked_steps
+            wall_magnet_penalty = max(wall_magnet_penalty, -8.0)  # 封顶-8.0
 
         # 被阻挡时的奖励衰减系数（阻挡越久衰减越大，最低0.1）
+        blocked_decay = 1.0
         if self.treasure_blocked_steps > 0:
             blocked_decay = max(0.1, 1.0 - 0.15 * self.treasure_blocked_steps)
-        else:
-            blocked_decay = 1.0
+
+        # 7.6 宝箱接近奖励塑形
+        treasure_shaping = 0.0
+        orbiting_penalty = 0.0  # 绕宝箱惩罚
 
         # ===== 怪物威胁检测 =====
         # 1. 怪物在宝箱旁边 → 宝箱是危险的
@@ -677,29 +707,24 @@ class Preprocessor:
                 # 正在远离宝箱：轻微惩罚（衰减时降低惩罚，避免被墙/怪吸住后远离时反而不惩罚）
                 treasure_shaping = 0.1 * dist_delta * total_decay
 
-            # ===== 绕宝箱惩罚（核心修改）=====
+            # ===== 绕宝箱惩罚 =====
             # 检测"在宝箱附近但距离不减少"的模式
             if nearest_treasure_dist < 5.0:
-                # 检查是否在绕圈：距离几乎不变
                 dist_change = abs(self.last_treasure_dist - nearest_treasure_dist)
-                if dist_change < 0.5:  # 距离几乎没变
+                if dist_change < 0.5:
                     self.near_treasure_orbit_steps += 1
                 else:
                     self.near_treasure_orbit_steps = max(0, self.near_treasure_orbit_steps - 1)
 
                 # 绕圈超过3步就惩罚
                 if self.near_treasure_orbit_steps > 3:
-                    orbiting_penalty = -1.0  # 绕圈惩罚
-                    # 距离越近绕圈惩罚越大
+                    orbiting_penalty = -1.0
                     if nearest_treasure_dist < 3.0:
                         orbiting_penalty = -2.0
 
-                    # ===== 被墙吸附额外惩罚 =====
-                    # 如果绕圈同时路径被阻挡，说明是卡在墙上了，加大惩罚
-                    if is_path_blocked and self.treasure_blocked_steps > 2:
-                        wall_magnet_penalty = -2.0
-                        if self.treasure_blocked_steps > 5:
-                            wall_magnet_penalty = -4.0  # 卡得越久惩罚越重
+                    # 绕圈+路径被阻挡时，额外惩罚已在 wall_magnet_penalty 中处理
+                    if is_path_blocked:
+                        wall_magnet_penalty = max(wall_magnet_penalty, -2.0 * self.treasure_blocked_steps)
             else:
                 self.near_treasure_orbit_steps = 0
 
@@ -723,12 +748,16 @@ class Preprocessor:
             elif last_action in [4, 5, 6, 7]:
                 straight_approach_bonus = -0.3
 
-        # 7.8 宝箱视野内存在奖励（受威胁衰减）
+        # 7.8 宝箱视野内存在奖励（路径被阻挡时取消）
         treasure_view_bonus = 0.0
         if (nearest_treasure_pos is not None
                 and np.isfinite(nearest_treasure_dist)
                 and nearest_treasure_dist < 10.0):
-            treasure_view_bonus = 0.02 * total_decay
+            # 路径被完全阻挡时，取消宝箱视野奖励
+            if is_path_blocked:
+                treasure_view_bonus = 0.0
+            else:
+                treasure_view_bonus = 0.02 * total_decay
 
         # =========================================================================
         # 7.9 闪现逃生奖励（修复版）
